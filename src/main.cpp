@@ -93,6 +93,10 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
+  // Configure ADC for full range on light sensor
+  analogSetAttenuation(ADC_11db);  // 0-3.3V range for 12-bit ADC
+  analogReadResolution(12);        // 12-bit resolution (0-4095)
+
   // WiFi connect
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
