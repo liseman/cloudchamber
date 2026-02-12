@@ -6,15 +6,24 @@
 #include <Adafruit_SHT4x.h>
 #include <WiFi.h>
 #include <ArduinoHttpClient.h>
+#include <Adafruit_NeoPixel.h>
 
-// Pin assignments (Feather M4)
+// Pin assignments (Feather ESP32-S3)
 const uint8_t DS_HOT_PIN = 5;    // hot end
 const uint8_t DS_COLD_PIN = 6;   // cold end
 const uint8_t DS_MID_PIN = 9;    // middle
 const uint8_t RELAY_HOT_PIN = 10;
 const uint8_t RELAY_COLD_PIN = 11;
 const uint8_t LIGHT_PIN = A2;    // ALS-PT19
-const uint8_t LED_PIN = 13;      // Onboard LED (GPIO 13 on Feather ESP32S3)
+
+// NeoPixel RGB LED using board-defined constants
+#ifdef PIN_NEOPIXEL
+  #define NEO_PIN PIN_NEOPIXEL
+#else
+  #define NEO_PIN 13  // fallback to GPIO 13
+#endif
+
+Adafruit_NeoPixel pixel(1, NEO_PIN, NEO_GRB + NEO_KHZ800);
 
 // WiFi and Adafruit IO
 const char* WIFI_SSID = "cult";
@@ -43,9 +52,16 @@ Adafruit_SHT4x sht4 = Adafruit_SHT4x();
 
 unsigned long lastRead = 0;
 const unsigned long READ_INTERVAL = 2000;
+unsigned long lastRelayControl = 0;
+const unsigned long RELAY_CONTROL_INTERVAL = 5000;
 
 bool relayHotState = false;
 bool relayColdState = false;
+
+float lastHotTemp = NAN;
+float lastColdTemp = NAN;
+
+bool lastReadValid = false;  // track if we have valid sensor readings
 
 void setRelayHot(bool on) {
   relayHotState = on;
@@ -90,8 +106,26 @@ void setup() {
   setRelayHot(false);
   setRelayCold(false);
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  // Startup relay test: alternate hot/cold relays on for 1s each, 3 cycles.
+  for (int i = 0; i < 3; i++) {
+    setRelayHot(true);
+    setRelayCold(false);
+    delay(1000);
+    setRelayHot(false);
+    delay(200);
+    setRelayCold(true);
+    delay(1000);
+    setRelayCold(false);
+    delay(200);
+  }
+
+  // Initialize NeoPixel RGB LED
+  #ifdef NEOPIXEL_POWER
+    pinMode(NEOPIXEL_POWER, OUTPUT);
+    digitalWrite(NEOPIXEL_POWER, HIGH);
+  #endif
+  pixel.begin();
+  pixel.show();
 
   // Configure ADC for full range on light sensor
   analogSetAttenuation(ADC_11db);  // 0-3.3V range for 12-bit ADC
@@ -126,6 +160,52 @@ void loop() {
   }
 
   unsigned long now = millis();
+  
+  // Update RGB LED status - all modes pulse with 4 second cycle
+  // This runs every loop iteration for smooth pulsing
+  // Green pulse: readings OK + uploading success
+  // Yellow pulse: readings OK + not uploading/failed (orange tint)
+  // Red pulse: no readings
+  static unsigned long ledPulseStart = 0;
+  uint32_t ledColor = 0;
+  
+  // Calculate 4-second pulsing cycle:
+  // 0-1000ms: increasing from 0 to 20%
+  // 1000-2000ms: hold at 20%
+  // 2000-3000ms: decreasing from 20% to 0%
+  // 3000-4000ms: hold at 0%
+  unsigned long pulseCycle = (now - ledPulseStart) % 4000;
+  uint8_t brightness = 0;
+  
+  if (pulseCycle < 1000) {
+    // Increasing phase: 0 to 20%
+    brightness = (pulseCycle * 51) / 1000;
+  } else if (pulseCycle < 2000) {
+    // Hold at 20%
+    brightness = 51;
+  } else if (pulseCycle < 3000) {
+    // Decreasing phase: 20% to 0%
+    brightness = (51 * (3000 - pulseCycle)) / 1000;
+  } else {
+    // Hold at 0%
+    brightness = 0;
+  }
+  
+  if (!lastReadValid) {
+    // Red pulse: no valid readings
+    ledColor = pixel.Color(brightness, 0, 0);
+  } else if (lastSendSuccess && WiFi.status() == WL_CONNECTED) {
+    // Green pulse: readings OK + uploading success
+    ledColor = pixel.Color(0, brightness, 0);
+  } else {
+    // Yellow/Orange pulse: readings OK but not uploading/failed (reduced green for orange tint)
+    ledColor = pixel.Color(brightness, brightness / 3, 0);
+  }
+  
+  pixel.setPixelColor(0, ledColor);
+  pixel.show();
+  
+  // Sensor reading timing check
   if (now - lastRead < READ_INTERVAL) return;
   lastRead = now;
 
@@ -136,6 +216,13 @@ void loop() {
   float tHot = sensorsHot.getTempCByIndex(0);
   float tMid = sensorsMid.getTempCByIndex(0);
   float tCold = sensorsCold.getTempCByIndex(0);
+  
+  // Check if readings are valid (not NaN or sensor disconnect)
+  lastReadValid = !isnan(tHot) && !isnan(tMid) && !isnan(tCold);
+  if (lastReadValid) {
+    lastHotTemp = tHot;
+    lastColdTemp = tCold;
+  }
 
   sensors_event_t humidity, temp_event;
   float aTemp = NAN, aHum = NAN;
@@ -190,21 +277,19 @@ void loop() {
     }
   }
 
-  // Pulse LED green if successful
-  static unsigned long ledPulseStart = 0;
-  static bool ledOn = false;
-  if (WiFi.status() == WL_CONNECTED && lastSendSuccess) {
-    if (!ledOn) {
-      digitalWrite(LED_PIN, HIGH);
-      ledOn = true;
-      ledPulseStart = now;
-    } else if (now - ledPulseStart > 200) {
-      digitalWrite(LED_PIN, LOW);
-      ledOn = false;
-      ledPulseStart = now + 800; // off for 800ms, on for 200ms
+  // Relay control every minute based on hot/cold end thresholds
+  if (now - lastRelayControl > RELAY_CONTROL_INTERVAL && lastReadValid) {
+    lastRelayControl = now;
+    if (lastHotTemp > 2.0f) {
+      setRelayHot(false);
+    } else if (lastHotTemp < -2.0f) {
+      setRelayHot(true);
     }
-  } else {
-    digitalWrite(LED_PIN, LOW);
-    ledOn = false;
+
+    if (lastColdTemp < -22.0f) {
+      setRelayCold(false);
+    } else if (lastColdTemp > -18.0f) {
+      setRelayCold(true);
+    }
   }
 }
