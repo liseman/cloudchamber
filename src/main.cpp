@@ -52,16 +52,26 @@ Adafruit_SHT4x sht4 = Adafruit_SHT4x();
 
 unsigned long lastRead = 0;
 const unsigned long READ_INTERVAL = 2000;
+const unsigned long SERIAL_CHECK_INTERVAL = 2000;
 unsigned long lastRelayControl = 0;
 const unsigned long RELAY_CONTROL_INTERVAL = 5000;
 
 bool relayHotState = false;
 bool relayColdState = false;
+bool serialConnected = false;
+unsigned long lastSerialCheck = 0;
 
 float lastHotTemp = NAN;
 float lastColdTemp = NAN;
 
 bool lastReadValid = false;  // track if we have valid sensor readings
+
+void updateSerialConnection(unsigned long now) {
+  if (now - lastSerialCheck >= SERIAL_CHECK_INTERVAL) {
+    lastSerialCheck = now;
+    serialConnected = (bool)Serial;
+  }
+}
 
 void setRelayHot(bool on) {
   relayHotState = on;
@@ -153,13 +163,16 @@ void setup() {
 }
 
 void loop() {
-  // handle serial commands
-  while (Serial.available()) {
-    String line = Serial.readStringUntil('\n');
-    if (line.length() > 0) handleSerialCommand(line);
-  }
-
   unsigned long now = millis();
+  updateSerialConnection(now);
+
+  // handle serial commands
+  if (serialConnected) {
+    while (Serial.available()) {
+      String line = Serial.readStringUntil('\n');
+      if (line.length() > 0) handleSerialCommand(line);
+    }
+  }
   
   // Update RGB LED status - all modes pulse with 4 second cycle
   // This runs every loop iteration for smooth pulsing
@@ -235,17 +248,19 @@ void loop() {
   int adcMax = 4095;
   if (lightRaw > adcMax) lightRaw = adcMax;
 
-  // Print a single-line, labeled reading that the host GUI can parse
-  Serial.print("SENSORS;");
-  Serial.print("HOT:"); Serial.print(tHot, 2); Serial.print(";");
-  Serial.print("MID:"); Serial.print(tMid, 2); Serial.print(";");
-  Serial.print("COLD:"); Serial.print(tCold, 2); Serial.print(";");
-  Serial.print("AIR_T:"); if (!isnan(aTemp)) Serial.print(aTemp,2); else Serial.print("NaN"); Serial.print(";");
-  Serial.print("AIR_H:"); if (!isnan(aHum)) Serial.print(aHum,2); else Serial.print("NaN"); Serial.print(";");
-  Serial.print("LIGHT:"); Serial.print(lightRaw); Serial.print(";");
-  Serial.print("RHOT:"); Serial.print(relayHotState?"ON":"OFF"); Serial.print(";");
-  Serial.print("RCOLD:"); Serial.print(relayColdState?"ON":"OFF");
-  Serial.println();
+  // Print a single-line, labeled reading when a serial host is connected
+  if (serialConnected) {
+    Serial.print("SENSORS;");
+    Serial.print("HOT:"); Serial.print(tHot, 2); Serial.print(";");
+    Serial.print("MID:"); Serial.print(tMid, 2); Serial.print(";");
+    Serial.print("COLD:"); Serial.print(tCold, 2); Serial.print(";");
+    Serial.print("AIR_T:"); if (!isnan(aTemp)) Serial.print(aTemp,2); else Serial.print("NaN"); Serial.print(";");
+    Serial.print("AIR_H:"); if (!isnan(aHum)) Serial.print(aHum,2); else Serial.print("NaN"); Serial.print(";");
+    Serial.print("LIGHT:"); Serial.print(lightRaw); Serial.print(";");
+    Serial.print("RHOT:"); Serial.print(relayHotState?"ON":"OFF"); Serial.print(";");
+    Serial.print("RCOLD:"); Serial.print(relayColdState?"ON":"OFF");
+    Serial.println();
+  }
 
   // Send to Adafruit IO every minute
   if (WiFi.status() == WL_CONNECTED && (now - lastSend > SEND_INTERVAL)) {
@@ -266,10 +281,14 @@ void loop() {
         client.endRequest();
         int status = client.responseStatusCode();
         if (status != 200 && status != 201) {
-          Serial.print("[AIO ERROR] Feed "); Serial.print(FEEDS[i]); Serial.print(": "); Serial.println(status);
+          if (serialConnected) {
+            Serial.print("[AIO ERROR] Feed "); Serial.print(FEEDS[i]); Serial.print(": "); Serial.println(status);
+          }
           lastSendSuccess = false;
         } else {
-          Serial.print("[AIO OK] "); Serial.print(FEEDS[i]); Serial.print(" sent: "); Serial.println(values[i], 2);
+          if (serialConnected) {
+            Serial.print("[AIO OK] "); Serial.print(FEEDS[i]); Serial.print(" sent: "); Serial.println(values[i], 2);
+          }
         }
         // consume response body
         while (client.available()) client.read();
