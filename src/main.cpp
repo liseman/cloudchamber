@@ -26,8 +26,8 @@ const uint8_t LIGHT_PIN = A2;    // ALS-PT19
 Adafruit_NeoPixel pixel(1, NEO_PIN, NEO_GRB + NEO_KHZ800);
 
 // WiFi and Adafruit IO
-const char* WIFI_SSID = "cult";
-const char* WIFI_PASS = "hereticality";
+const char* WIFI_SSID = "IndieBioSF";
+const char* WIFI_PASS = "IBSF@D0gP@tch!";
 const char* AIO_KEY = "4c06ce1666504628a241f07107012585";
 const char* AIO_USER = "liseman";
 const char* FEEDS[] = {"hot", "mid", "cold", "air-temp", "air-humidity", "light"};
