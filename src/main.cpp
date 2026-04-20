@@ -11,7 +11,6 @@
 #include <DallasTemperature.h>
 #include <OneWire.h>
 #include <Preferences.h>
-#include <TAMC_GT911.h>
 #include <lvgl.h>
 #include <WiFi.h>
 #include <Wire.h>
@@ -25,13 +24,8 @@ constexpr int kNumFeeds = sizeof(kFeedNames) / sizeof(kFeedNames[0]);
 constexpr unsigned long kReadIntervalMs = 2000;
 constexpr unsigned long kRelayIntervalMs = 1000;
 constexpr unsigned long kSendIntervalMs = 60000;
-constexpr unsigned long kTouchDebounceMs = 220;
-constexpr unsigned long kTouchPollMs = 30;
 constexpr unsigned long kWifiRetryMs = 15000;
 constexpr float kTargetHysteresisC = 2.0f;
-constexpr uint8_t kGt911PrimaryAddress = 0x14;
-constexpr uint8_t kGt911SecondaryAddress = 0x5D;
-constexpr uint8_t kTouchCalibrationVersion = 1;
 
 constexpr uint16_t kColorBackground = 0x18E3;
 constexpr uint16_t kColorPanel = 0xFFFF;
@@ -44,14 +38,12 @@ constexpr uint16_t kColorYellow = 0xF6E7;
 constexpr uint16_t kColorRed = 0xD1A6;
 constexpr uint16_t kColorButton = 0xE69A;
 
-constexpr uint32_t kUiBgHex = 0xE7EEF1;
-constexpr uint32_t kUiCardHex = 0xFCFEFD;
-constexpr uint32_t kUiInkHex = 0x20343E;
-constexpr uint32_t kUiMutedHex = 0x5F7884;
-constexpr uint32_t kUiLineHex = 0xD4DFE4;
-constexpr uint32_t kUiAccentHex = 0x2E8CA6;
-constexpr uint32_t kUiTouchHex = 0xCFEAF1;
-constexpr uint32_t kUiTouchBorderHex = 0x67A6B7;
+constexpr uint32_t kUiBgHex = 0xEEF3F4;
+constexpr uint32_t kUiCardHex = 0xFFFFFF;
+constexpr uint32_t kUiInkHex = 0x16303A;
+constexpr uint32_t kUiMutedHex = 0x4D6772;
+constexpr uint32_t kUiLineHex = 0xC8D6DC;
+constexpr uint32_t kUiAccentHex = 0x1F718B;
 
 struct AppSettings {
   String wifiSsid;
@@ -70,19 +62,9 @@ struct SensorState {
   float airC = NAN;
   float humidity = NAN;
   int lightRaw = 0;
+  int ds18Count = 0;
   bool probeValid = false;
   bool airValid = false;
-};
-
-struct TouchCalibration {
-  bool valid = false;
-  bool swapXY = false;
-  bool invertX = false;
-  bool invertY = false;
-  int rawMinX = 0;
-  int rawMaxX = 479;
-  int rawMinY = 0;
-  int rawMaxY = 319;
 };
 
 struct Rect {
@@ -92,7 +74,7 @@ struct Rect {
   int16_t h;
 };
 
-enum class ScreenId { Dashboard, WifiMenu, LoggingMenu, TargetMenu, TextEditor, TouchCal };
+enum class ScreenId { Dashboard, WifiMenu, LoggingMenu, TargetMenu, TextEditor };
 enum class TargetField { Inlet, Outlet };
 enum class TextField { WifiSsid, WifiPass, AioUser, AioKey };
 enum class StatusState { Good, Warning, Error };
@@ -105,13 +87,9 @@ Adafruit_SHT4x sht4;
 Preferences preferences;
 WiFiClient wifiClient;
 HttpClient httpClient(wifiClient, "io.adafruit.com", 80);
-TAMC_GT911 touchController(BoardConfig::kI2cSdaPin, BoardConfig::kI2cSclPin,
-                           BoardConfig::kTouchIntPin, BoardConfig::kTouchResetPin,
-                           480, 320);
 
 AppSettings settings;
 SensorState sensors;
-TouchCalibration touchCal;
 
 ScreenId currentScreen = ScreenId::Dashboard;
 TargetField activeTarget = TargetField::Inlet;
@@ -120,10 +98,6 @@ String editorValue;
 bool editorShift = false;
 bool uiDirty = true;
 bool dashboardFrameDrawn = false;
-bool showTouchDebug = false;
-bool touchDebugLatched = false;
-bool touchCalActive = true;
-bool touchCalWaitForRelease = false;
 
 bool relayHotState = false;
 bool relayColdState = false;
@@ -136,9 +110,6 @@ bool serialConnected = false;
 unsigned long lastReadMs = 0;
 unsigned long lastRelayMs = 0;
 unsigned long lastSendMs = 0;
-unsigned long lastTouchMs = 0;
-unsigned long lastTouchPollMs = 0;
-unsigned long lastTouchReportMs = 0;
 unsigned long lastWifiAttemptMs = 0;
 unsigned long lastSerialCheckMs = 0;
 
@@ -146,15 +117,6 @@ StatusState wifiState = StatusState::Warning;
 StatusState loggingState = StatusState::Warning;
 StatusState lastDrawnWifiState = StatusState::Error;
 StatusState lastDrawnLoggingState = StatusState::Error;
-uint8_t activeTouchAddress = 0;
-int16_t lastTouchDebugX = -1;
-int16_t lastTouchDebugY = -1;
-
-constexpr int kTouchCalPointCount = 4;
-int touchCalStep = 0;
-TP_Point touchCalSamples[kTouchCalPointCount];
-const int16_t kTouchCalTargets[kTouchCalPointCount][2] = {
-    {36, 36}, {444, 36}, {36, 284}, {444, 284}};
 
 Rect wifiBadgeRect = {260, 18, 190, 44};
 Rect loggingBadgeRect = {30, 18, 190, 44};
@@ -165,38 +127,25 @@ constexpr uint16_t kLvglBufferLines = 24;
 lv_color_t lvglBuffer[480 * kLvglBufferLines];
 lv_disp_draw_buf_t lvglDrawBuffer;
 lv_disp_drv_t lvglDisplayDriver;
-lv_indev_drv_t lvglInputDriver;
 unsigned long lastLvglTickMs = 0;
 bool lvglReady = false;
 bool dashboardUiBuilt = false;
 bool dashboardScreenLoaded = false;
-bool lvglTouchPressed = false;
-int16_t lvglTouchX = 0;
-int16_t lvglTouchY = 0;
-unsigned long lastLvglTouchMs = 0;
 
 lv_obj_t* dashboardScreen = nullptr;
-lv_obj_t* loggingButton = nullptr;
-lv_obj_t* touchButton = nullptr;
-lv_obj_t* wifiButton = nullptr;
 lv_obj_t* loggingLabel = nullptr;
-lv_obj_t* touchLabel = nullptr;
 lv_obj_t* wifiLabel = nullptr;
 lv_obj_t* airTempValueLabel = nullptr;
 lv_obj_t* airHumidityValueLabel = nullptr;
-lv_obj_t* inletTargetButton = nullptr;
 lv_obj_t* inletTargetLabel = nullptr;
 lv_obj_t* inletValueLabel = nullptr;
 lv_obj_t* inletRelayLabel = nullptr;
 lv_obj_t* middleValueLabel = nullptr;
 lv_obj_t* lightValueLabel = nullptr;
-lv_obj_t* outletTargetButton = nullptr;
 lv_obj_t* outletTargetLabel = nullptr;
 lv_obj_t* outletValueLabel = nullptr;
 lv_obj_t* outletRelayLabel = nullptr;
 lv_obj_t* dashboardCard = nullptr;
-
-void mapTouchPoint(int16_t rawX, int16_t rawY, int16_t& x, int16_t& y);
 
 bool isValidProbeTemp(float value) {
   return value != DEVICE_DISCONNECTED_C && value > -80.0f && value < 125.0f;
@@ -232,6 +181,16 @@ String formatTemp(float value) {
     return "--.- C";
   }
   return String(value, 1) + " C";
+}
+
+String formatProbeValue(float value, int probeIndex) {
+  if (sensors.ds18Count <= probeIndex) {
+    return "missing";
+  }
+  if (!isValidProbeTemp(value)) {
+    return "read err";
+  }
+  return formatTemp(value);
 }
 
 String formatHumidity(float value) {
@@ -315,12 +274,12 @@ uint16_t statusColor(StatusState state) {
 lv_color_t statusColorLv(StatusState state) {
   switch (state) {
     case StatusState::Good:
-      return lv_palette_main(LV_PALETTE_GREEN);
+      return lv_color_hex(0x2FA84F);
     case StatusState::Warning:
-      return lv_palette_main(LV_PALETTE_AMBER);
+      return lv_color_hex(0xD7A300);
     case StatusState::Error:
     default:
-      return lv_palette_main(LV_PALETTE_RED);
+      return lv_color_hex(0xC53A32);
   }
 }
 
@@ -340,20 +299,6 @@ void styleFlatButton(lv_obj_t* button, lv_color_t bg, lv_color_t border) {
   lv_obj_set_style_pad_all(button, 0, LV_PART_MAIN);
 }
 
-void startTouchCalibration() {
-  touchCalActive = true;
-  touchCalStep = 0;
-  lvglTouchPressed = false;
-  lvglTouchX = 0;
-  lvglTouchY = 0;
-  touchCalWaitForRelease = true;
-  dashboardScreenLoaded = false;
-  lastTouchMs = 0;
-  lastLvglTouchMs = 0;
-  currentScreen = ScreenId::TouchCal;
-  uiDirty = true;
-}
-
 void lvglFlush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
   const int32_t width = area->x2 - area->x1 + 1;
   const int32_t height = area->y2 - area->y1 + 1;
@@ -366,88 +311,15 @@ void lvglFlush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) 
   lv_disp_flush_ready(disp);
 }
 
-void lvglTouchRead(lv_indev_drv_t* indev_drv, lv_indev_data_t* data) {
-  (void)indev_drv;
-  data->state = lvglTouchPressed ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
-  data->point.x = lvglTouchX;
-  data->point.y = lvglTouchY;
-  if (currentScreen != ScreenId::Dashboard || touchCalActive || activeTouchAddress == 0) {
-    lvglTouchPressed = false;
-    return;
-  }
-
-  touchController.read();
-  if (!touchController.isTouched) {
-    lvglTouchPressed = false;
-    return;
-  }
-
-  const int16_t rawX = touchController.points[0].x;
-  const int16_t rawY = touchController.points[0].y;
-  if (rawX < 0 || rawY < 0 || rawX > 480 || rawY > 320) {
-    lvglTouchPressed = false;
-    return;
-  }
-
-  int16_t x = 0;
-  int16_t y = 0;
-  mapTouchPoint(rawX, rawY, x, y);
-  if (millis() - lastLvglTouchMs < kTouchDebounceMs &&
-      abs(x - lvglTouchX) < 3 && abs(y - lvglTouchY) < 3) {
-    data->state = lvglTouchPressed ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
-    data->point.x = lvglTouchX;
-    data->point.y = lvglTouchY;
-    return;
-  }
-
-  lvglTouchX = x;
-  lvglTouchY = y;
-  lvglTouchPressed = true;
-  lastLvglTouchMs = millis();
-  data->state = LV_INDEV_STATE_PR;
-  data->point.x = x;
-  data->point.y = y;
-}
-
-void openWifiMenuEvent(lv_event_t* event) {
-  (void)event;
-  currentScreen = ScreenId::WifiMenu;
-  uiDirty = true;
-}
-
-void openLoggingMenuEvent(lv_event_t* event) {
-  (void)event;
-  currentScreen = ScreenId::LoggingMenu;
-  uiDirty = true;
-}
-
-void openTouchCalibrationEvent(lv_event_t* event) {
-  (void)event;
-  startTouchCalibration();
-}
-
-void openInletTargetEvent(lv_event_t* event) {
-  (void)event;
-  activeTarget = TargetField::Inlet;
-  currentScreen = ScreenId::TargetMenu;
-  uiDirty = true;
-}
-
-void openOutletTargetEvent(lv_event_t* event) {
-  (void)event;
-  activeTarget = TargetField::Outlet;
-  currentScreen = ScreenId::TargetMenu;
-  uiDirty = true;
-}
-
-void styleHeaderButton(lv_obj_t* button, lv_obj_t** label, const char* text) {
-  lv_obj_set_size(button, 96, 32);
-  styleFlatButton(button, lv_color_hex(kUiCardHex), lv_color_hex(0x9bb7c8));
-  *label = lv_label_create(button);
-  lv_label_set_text(*label, text);
-  lv_obj_set_style_text_color(*label, lv_color_hex(kUiInkHex), LV_PART_MAIN);
-  lv_obj_set_style_text_font(*label, &lv_font_montserrat_16, LV_PART_MAIN);
-  lv_obj_center(*label);
+lv_obj_t* createTextLabel(lv_obj_t* parent, int x, int y, const char* text,
+                          const lv_font_t* font, uint32_t colorHex) {
+  lv_obj_t* label = lv_label_create(parent);
+  lv_obj_set_pos(label, x, y);
+  lv_label_set_text(label, text);
+  lv_obj_set_style_text_font(label, font, LV_PART_MAIN);
+  lv_obj_set_style_text_color(label, lv_color_hex(colorHex), LV_PART_MAIN);
+  lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+  return label;
 }
 
 lv_obj_t* createValueLabel(lv_obj_t* parent, int x, int y, int w, lv_text_align_t align) {
@@ -455,14 +327,15 @@ lv_obj_t* createValueLabel(lv_obj_t* parent, int x, int y, int w, lv_text_align_
   lv_obj_set_size(label, w, LV_SIZE_CONTENT);
   lv_obj_set_pos(label, x, y);
   lv_obj_set_style_text_align(label, align, LV_PART_MAIN);
-  lv_obj_set_style_text_font(label, &lv_font_montserrat_20, LV_PART_MAIN);
+  lv_obj_set_style_text_font(label, &lv_font_montserrat_24, LV_PART_MAIN);
   lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
   return label;
 }
 
-void setStatusButtonColor(lv_obj_t* button, StatusState state) {
-  styleFlatButton(button, lv_color_mix(statusColorLv(state), lv_color_white(), LV_OPA_20),
-                  statusColorLv(state));
+void setStatusLabelColor(lv_obj_t* label, StatusState state) {
+  if (label != nullptr) {
+    lv_obj_set_style_text_color(label, statusColorLv(state), LV_PART_MAIN);
+  }
 }
 
 void syncDashboardLvgl() {
@@ -470,21 +343,20 @@ void syncDashboardLvgl() {
     return;
   }
 
-  setStatusButtonColor(loggingButton, loggingState);
-  setStatusButtonColor(wifiButton, wifiState);
-  styleFlatButton(touchButton, lv_color_hex(kUiTouchHex), lv_color_hex(kUiTouchBorderHex));
+  setStatusLabelColor(loggingLabel, loggingState);
+  setStatusLabelColor(wifiLabel, wifiState);
 
   lv_label_set_text(airTempValueLabel, formatTemp(sensors.airC).c_str());
   lv_label_set_text(airHumidityValueLabel, formatHumidity(sensors.humidity).c_str());
-  lv_label_set_text(inletTargetLabel, ("inlet (" + String(settings.inletTargetC, 1) + "C)")
+  lv_label_set_text(inletTargetLabel, ("inlet (" + String(settings.inletTargetC, 1) + "C):")
                                         .c_str());
-  lv_label_set_text(inletValueLabel, formatTemp(sensors.inletC).c_str());
+  lv_label_set_text(inletValueLabel, formatProbeValue(sensors.inletC, 0).c_str());
   lv_label_set_text(inletRelayLabel, relayHotState ? "heater ON" : "heater OFF");
-  lv_label_set_text(middleValueLabel, formatTemp(sensors.middleC).c_str());
+  lv_label_set_text(middleValueLabel, formatProbeValue(sensors.middleC, 1).c_str());
   lv_label_set_text(lightValueLabel, String(sensors.lightRaw).c_str());
-  lv_label_set_text(outletTargetLabel, ("outlet (" + String(settings.outletTargetC, 1) + "C)")
+  lv_label_set_text(outletTargetLabel, ("outlet (" + String(settings.outletTargetC, 1) + "C):")
                                          .c_str());
-  lv_label_set_text(outletValueLabel, formatTemp(sensors.outletC).c_str());
+  lv_label_set_text(outletValueLabel, formatProbeValue(sensors.outletC, 2).c_str());
   lv_label_set_text(outletRelayLabel, relayColdState ? "cooler ON" : "cooler OFF");
 }
 
@@ -504,8 +376,8 @@ void createDashboardLvgl() {
   dashboardCard = lv_obj_create(dashboardScreen);
   lv_obj_remove_style_all(dashboardCard);
   lv_obj_clear_flag(dashboardCard, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_size(dashboardCard, 456, 300);
-  lv_obj_set_pos(dashboardCard, 12, 10);
+  lv_obj_set_size(dashboardCard, 458, 302);
+  lv_obj_set_pos(dashboardCard, 11, 9);
   lv_obj_set_style_radius(dashboardCard, 24, LV_PART_MAIN);
   lv_obj_set_style_border_width(dashboardCard, 2, LV_PART_MAIN);
   lv_obj_set_style_border_color(dashboardCard, lv_color_hex(kUiInkHex), LV_PART_MAIN);
@@ -513,95 +385,68 @@ void createDashboardLvgl() {
   lv_obj_set_style_shadow_width(dashboardCard, 0, LV_PART_MAIN);
   lv_obj_set_style_pad_all(dashboardCard, 0, LV_PART_MAIN);
 
-  lv_obj_t* headerRow = lv_obj_create(dashboardCard);
-  lv_obj_remove_style_all(headerRow);
-  lv_obj_set_size(headerRow, 420, 36);
-  lv_obj_set_pos(headerRow, 18, 14);
-  lv_obj_set_flex_flow(headerRow, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(headerRow, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
-                        LV_FLEX_ALIGN_CENTER);
-  lv_obj_clear_flag(headerRow, LV_OBJ_FLAG_SCROLLABLE);
+  loggingLabel = createTextLabel(dashboardCard, 18, 18, "logging",
+                                 &lv_font_montserrat_18, kUiInkHex);
+  lv_obj_set_width(loggingLabel, 120);
+  lv_obj_set_style_text_align(loggingLabel, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
 
-  loggingButton = lv_btn_create(headerRow);
-  styleHeaderButton(loggingButton, &loggingLabel, "logging");
-  lv_obj_add_event_cb(loggingButton, openLoggingMenuEvent, LV_EVENT_CLICKED, nullptr);
-
-  touchButton = lv_btn_create(headerRow);
-  styleHeaderButton(touchButton, &touchLabel, "touch");
-  lv_obj_add_event_cb(touchButton, openTouchCalibrationEvent, LV_EVENT_CLICKED, nullptr);
-
-  wifiButton = lv_btn_create(headerRow);
-  styleHeaderButton(wifiButton, &wifiLabel, "wifi");
-  lv_obj_add_event_cb(wifiButton, openWifiMenuEvent, LV_EVENT_CLICKED, nullptr);
+  wifiLabel = createTextLabel(dashboardCard, 388, 18, "wifi",
+                              &lv_font_montserrat_18, kUiInkHex);
+  lv_obj_set_width(wifiLabel, 52);
+  lv_obj_set_style_text_align(wifiLabel, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
 
   auto addRow = [&](int y, const char* labelText) {
     lv_obj_t* label = lv_label_create(dashboardCard);
     lv_obj_set_pos(label, 26, y);
     lv_label_set_text(label, labelText);
     lv_obj_set_style_text_color(label, lv_color_hex(kUiInkHex), LV_PART_MAIN);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_18, LV_PART_MAIN);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_22, LV_PART_MAIN);
     lv_obj_t* line = lv_obj_create(dashboardCard);
     lv_obj_remove_style_all(line);
     lv_obj_set_size(line, 424, 1);
-    lv_obj_set_pos(line, 16, y + 24);
+    lv_obj_set_pos(line, 16, y + 34);
     lv_obj_set_style_bg_color(line, lv_color_hex(kUiLineHex), LV_PART_MAIN);
     lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(line, 0, LV_PART_MAIN);
     lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
   };
 
-  addRow(72, "air in:");
-  addRow(120, "");
-  addRow(168, "middle:");
-  addRow(214, "light sensor:");
+  addRow(60, "air in:");
+  addRow(108, "");
+  addRow(156, "middle:");
+  addRow(204, "light sensor:");
 
-  airTempValueLabel = createValueLabel(dashboardCard, 236, 72, 94, LV_TEXT_ALIGN_RIGHT);
-  airHumidityValueLabel = createValueLabel(dashboardCard, 338, 72, 102, LV_TEXT_ALIGN_RIGHT);
+  airTempValueLabel = createValueLabel(dashboardCard, 198, 58, 110, LV_TEXT_ALIGN_RIGHT);
+  airHumidityValueLabel = createValueLabel(dashboardCard, 314, 58, 116, LV_TEXT_ALIGN_RIGHT);
   lv_obj_set_style_text_color(airTempValueLabel, lv_color_hex(kUiInkHex), LV_PART_MAIN);
-  lv_obj_set_style_text_color(airHumidityValueLabel, lv_color_hex(kUiMutedHex), LV_PART_MAIN);
+  lv_obj_set_style_text_color(airHumidityValueLabel, lv_color_hex(kUiInkHex), LV_PART_MAIN);
 
-  inletTargetButton = lv_btn_create(dashboardCard);
-  lv_obj_set_size(inletTargetButton, 186, 28);
-  lv_obj_set_pos(inletTargetButton, 20, 116);
-  lv_obj_set_style_bg_opa(inletTargetButton, LV_OPA_TRANSP, LV_PART_MAIN);
-  lv_obj_set_style_border_width(inletTargetButton, 0, LV_PART_MAIN);
-  lv_obj_set_style_shadow_width(inletTargetButton, 0, LV_PART_MAIN);
-  inletTargetLabel = lv_label_create(inletTargetButton);
-  lv_obj_set_style_text_color(inletTargetLabel, lv_color_hex(0x2d86a6), LV_PART_MAIN);
-  lv_obj_set_style_text_font(inletTargetLabel, &lv_font_montserrat_18, LV_PART_MAIN);
-  lv_obj_align(inletTargetLabel, LV_ALIGN_LEFT_MID, 0, 0);
-  lv_obj_add_event_cb(inletTargetButton, openInletTargetEvent, LV_EVENT_CLICKED, nullptr);
+  inletTargetLabel = createTextLabel(dashboardCard, 26, 108, "",
+                                     &lv_font_montserrat_22, kUiInkHex);
+  lv_obj_set_width(inletTargetLabel, 200);
 
-  inletValueLabel = createValueLabel(dashboardCard, 230, 120, 84, LV_TEXT_ALIGN_RIGHT);
+  inletValueLabel = createValueLabel(dashboardCard, 198, 106, 110, LV_TEXT_ALIGN_RIGHT);
   lv_obj_set_style_text_color(inletValueLabel, lv_color_hex(kUiInkHex), LV_PART_MAIN);
   inletRelayLabel = lv_label_create(dashboardCard);
-  lv_obj_set_pos(inletRelayLabel, 322, 124);
+  lv_obj_set_pos(inletRelayLabel, 314, 116);
   lv_obj_set_style_text_color(inletRelayLabel, lv_color_hex(kUiMutedHex), LV_PART_MAIN);
-  lv_obj_set_style_text_font(inletRelayLabel, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_style_text_font(inletRelayLabel, &lv_font_montserrat_16, LV_PART_MAIN);
 
-  middleValueLabel = createValueLabel(dashboardCard, 230, 168, 84, LV_TEXT_ALIGN_RIGHT);
-  lightValueLabel = createValueLabel(dashboardCard, 286, 214, 100, LV_TEXT_ALIGN_RIGHT);
+  middleValueLabel = createValueLabel(dashboardCard, 198, 154, 110, LV_TEXT_ALIGN_RIGHT);
+  lightValueLabel = createValueLabel(dashboardCard, 190, 202, 110, LV_TEXT_ALIGN_RIGHT);
   lv_obj_set_style_text_color(middleValueLabel, lv_color_hex(kUiInkHex), LV_PART_MAIN);
   lv_obj_set_style_text_color(lightValueLabel, lv_color_hex(kUiInkHex), LV_PART_MAIN);
 
-  outletTargetButton = lv_btn_create(dashboardCard);
-  lv_obj_set_size(outletTargetButton, 186, 28);
-  lv_obj_set_pos(outletTargetButton, 20, 250);
-  lv_obj_set_style_bg_opa(outletTargetButton, LV_OPA_TRANSP, LV_PART_MAIN);
-  lv_obj_set_style_border_width(outletTargetButton, 0, LV_PART_MAIN);
-  lv_obj_set_style_shadow_width(outletTargetButton, 0, LV_PART_MAIN);
-  outletTargetLabel = lv_label_create(outletTargetButton);
-  lv_obj_set_style_text_color(outletTargetLabel, lv_color_hex(0x2d86a6), LV_PART_MAIN);
-  lv_obj_set_style_text_font(outletTargetLabel, &lv_font_montserrat_18, LV_PART_MAIN);
-  lv_obj_align(outletTargetLabel, LV_ALIGN_LEFT_MID, 0, 0);
-  lv_obj_add_event_cb(outletTargetButton, openOutletTargetEvent, LV_EVENT_CLICKED, nullptr);
+  outletTargetLabel = createTextLabel(dashboardCard, 26, 252, "",
+                                      &lv_font_montserrat_22, kUiInkHex);
+  lv_obj_set_width(outletTargetLabel, 200);
 
-  outletValueLabel = createValueLabel(dashboardCard, 230, 252, 84, LV_TEXT_ALIGN_RIGHT);
+  outletValueLabel = createValueLabel(dashboardCard, 198, 250, 110, LV_TEXT_ALIGN_RIGHT);
   lv_obj_set_style_text_color(outletValueLabel, lv_color_hex(kUiInkHex), LV_PART_MAIN);
   outletRelayLabel = lv_label_create(dashboardCard);
-  lv_obj_set_pos(outletRelayLabel, 322, 256);
+  lv_obj_set_pos(outletRelayLabel, 314, 260);
   lv_obj_set_style_text_color(outletRelayLabel, lv_color_hex(kUiMutedHex), LV_PART_MAIN);
-  lv_obj_set_style_text_font(outletRelayLabel, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_style_text_font(outletRelayLabel, &lv_font_montserrat_16, LV_PART_MAIN);
 
   syncDashboardLvgl();
   dashboardUiBuilt = true;
@@ -616,11 +461,6 @@ void initLvgl() {
   lvglDisplayDriver.flush_cb = lvglFlush;
   lvglDisplayDriver.draw_buf = &lvglDrawBuffer;
   lv_disp_drv_register(&lvglDisplayDriver);
-
-  lv_indev_drv_init(&lvglInputDriver);
-  lvglInputDriver.type = LV_INDEV_TYPE_POINTER;
-  lvglInputDriver.read_cb = lvglTouchRead;
-  lv_indev_drv_register(&lvglInputDriver);
 
   createDashboardLvgl();
   lv_scr_load(dashboardScreen);
@@ -638,18 +478,6 @@ void saveSettings() {
   preferences.putFloat("outlet_target", settings.outletTargetC);
 }
 
-void saveTouchCalibration() {
-  preferences.putUChar("touch_ver", kTouchCalibrationVersion);
-  preferences.putBool("touch_valid", touchCal.valid);
-  preferences.putBool("touch_swap", touchCal.swapXY);
-  preferences.putBool("touch_inv_x", touchCal.invertX);
-  preferences.putBool("touch_inv_y", touchCal.invertY);
-  preferences.putInt("touch_min_x", touchCal.rawMinX);
-  preferences.putInt("touch_max_x", touchCal.rawMaxX);
-  preferences.putInt("touch_min_y", touchCal.rawMinY);
-  preferences.putInt("touch_max_y", touchCal.rawMaxY);
-}
-
 void loadSettings() {
   preferences.begin("cloudchamber", false);
   settings.wifiSsid =
@@ -663,16 +491,6 @@ void loadSettings() {
   settings.aioEnabled = preferences.getBool("aio_enabled", true);
   settings.inletTargetC = preferences.getFloat("inlet_target", 0.0f);
   settings.outletTargetC = preferences.getFloat("outlet_target", -20.0f);
-  const uint8_t savedTouchVersion = preferences.getUChar("touch_ver", 0);
-  touchCal.valid = preferences.getBool("touch_valid", false);
-  touchCal.swapXY = preferences.getBool("touch_swap", false);
-  touchCal.invertX = preferences.getBool("touch_inv_x", false);
-  touchCal.invertY = preferences.getBool("touch_inv_y", false);
-  touchCal.rawMinX = preferences.getInt("touch_min_x", 0);
-  touchCal.rawMaxX = preferences.getInt("touch_max_x", 479);
-  touchCal.rawMinY = preferences.getInt("touch_min_y", 0);
-  touchCal.rawMaxY = preferences.getInt("touch_max_y", 319);
-  touchCalActive = !touchCal.valid && savedTouchVersion != kTouchCalibrationVersion;
 }
 
 void startWifiConnect() {
@@ -745,14 +563,9 @@ void updateLoggingState() {
 }
 
 void drawBadge(const Rect& rect, const String& label, StatusState state) {
-  display.fillRoundRect(rect.x, rect.y, rect.w, rect.h, 18, kColorPanel);
-  display.drawRoundRect(rect.x, rect.y, rect.w, rect.h, 18, statusColor(state));
-  display.drawRoundRect(rect.x + 1, rect.y + 1, rect.w - 2, rect.h - 2, 18,
-                        statusColor(state));
-  display.fillCircle(rect.x + 24, rect.y + rect.h / 2, 8, statusColor(state));
-  drawFittedText({static_cast<int16_t>(rect.x + 42), static_cast<int16_t>(rect.y + 7),
-                  static_cast<int16_t>(rect.w - 56), static_cast<int16_t>(rect.h - 10)},
-                 label, kColorInk, kColorPanel, 2, 1, TextAlign::Left);
+  drawFittedText({rect.x, static_cast<int16_t>(rect.y + 5), rect.w, rect.h}, label,
+                 statusColor(state), kColorPanel, 2, 1,
+                 rect.x < 100 ? TextAlign::Left : TextAlign::Right);
 }
 
 void drawTopBar() {
@@ -814,18 +627,17 @@ void drawDashboardValues() {
                  kColorPanel, 1, 1, TextAlign::Right);
 
   clearValueArea(30, 128, 186, 18);
-  drawFittedText({30, 130, 54, 16}, "inlet", kColorInk, kColorPanel, 1, 1);
-  drawFittedText({86, 130, 124, 16}, "(" + String(settings.inletTargetC, 1) + "C):",
-                 kColorAccent, kColorPanel, 1, 1);
+  drawFittedText({30, 130, 180, 16}, "inlet (" + String(settings.inletTargetC, 1) + "C):",
+                 kColorInk, kColorPanel, 1, 1);
   clearValueArea(230, 128, 84, 18);
-  drawFittedText({230, 130, 84, 16}, formatTemp(sensors.inletC), kColorInk, kColorPanel,
+  drawFittedText({230, 130, 84, 16}, formatProbeValue(sensors.inletC, 0), kColorInk, kColorPanel,
                  1, 1, TextAlign::Right);
   clearValueArea(320, 126, 100, 14);
   drawFittedText({320, 128, 100, 12}, relayHotState ? "heater ON" : "heater OFF",
                  kColorMuted, kColorPanel, 1, 1);
 
   clearValueArea(230, 184, 84, 18);
-  drawFittedText({230, 186, 84, 16}, formatTemp(sensors.middleC), kColorInk, kColorPanel,
+  drawFittedText({230, 186, 84, 16}, formatProbeValue(sensors.middleC, 1), kColorInk, kColorPanel,
                  1, 1, TextAlign::Right);
 
   clearValueArea(286, 230, 100, 18);
@@ -833,38 +645,14 @@ void drawDashboardValues() {
                  1, 1, TextAlign::Right);
 
   clearValueArea(30, 260, 186, 18);
-  drawFittedText({30, 262, 60, 16}, "outlet", kColorInk, kColorPanel, 1, 1);
-  drawFittedText({96, 262, 118, 16}, "(" + String(settings.outletTargetC, 1) + "C):",
-                 kColorAccent, kColorPanel, 1, 1);
+  drawFittedText({30, 262, 180, 16}, "outlet (" + String(settings.outletTargetC, 1) + "C):",
+                 kColorInk, kColorPanel, 1, 1);
   clearValueArea(230, 260, 84, 18);
-  drawFittedText({230, 262, 84, 16}, formatTemp(sensors.outletC), kColorInk, kColorPanel,
+  drawFittedText({230, 262, 84, 16}, formatProbeValue(sensors.outletC, 2), kColorInk, kColorPanel,
                  1, 1, TextAlign::Right);
   clearValueArea(320, 260, 100, 14);
   drawFittedText({320, 262, 100, 12}, relayColdState ? "cooler ON" : "cooler OFF",
                  kColorMuted, kColorPanel, 1, 1);
-
-  if (showTouchDebug) {
-    clearValueArea(24, 286, 220, 16);
-    display.setTextColor(kColorRed, kColorPanel);
-    display.setTextSize(1);
-    display.setCursor(28, 288);
-    if (touchDebugLatched) {
-      display.print("touch ");
-      display.print(lastTouchDebugX);
-      display.print(",");
-      display.print(lastTouchDebugY);
-    } else {
-      display.print("touch none");
-    }
-
-    if (touchDebugLatched) {
-      display.drawRect(lastTouchDebugX - 6, lastTouchDebugY - 6, 12, 12, kColorRed);
-      display.drawLine(lastTouchDebugX - 8, lastTouchDebugY, lastTouchDebugX + 8,
-                       lastTouchDebugY, kColorRed);
-      display.drawLine(lastTouchDebugX, lastTouchDebugY - 8, lastTouchDebugX,
-                       lastTouchDebugY + 8, kColorRed);
-    }
-  }
 }
 
 void drawDashboard() {
@@ -1023,135 +811,6 @@ void drawTextEditor() {
   drawKey({390, 288, 60, 28}, "x", kColorRed, 0xFFFF);
 }
 
-void drawCalibrationTarget(int16_t x, int16_t y, uint16_t color) {
-  display.fillCircle(x, y, 10, color);
-  display.fillCircle(x, y, 4, kColorPanel);
-  display.drawLine(x - 18, y, x + 18, y, color);
-  display.drawLine(x, y - 18, x, y + 18, color);
-}
-
-void drawTouchCalibrationScreen() {
-  dashboardFrameDrawn = false;
-  display.fillScreen(kColorBackground);
-  display.fillRoundRect(12, 10, 456, 300, 24, kColorPanel);
-  display.drawRoundRect(12, 10, 456, 300, 24, kColorInk);
-  drawFittedText({28, 22, 260, 24}, "touch calibration", kColorInk, kColorPanel, 2, 1);
-  drawFittedText({28, 52, 340, 14}, "tap the red target in each corner",
-                 kColorMuted, kColorPanel, 1, 1);
-  drawFittedText({28, 68, 320, 14}, "lift your finger after each corner tap",
-                 kColorMuted, kColorPanel, 1, 1);
-
-  for (int i = 0; i < kTouchCalPointCount; ++i) {
-    const uint16_t color = (i == touchCalStep) ? kColorRed : kColorLine;
-    drawCalibrationTarget(kTouchCalTargets[i][0], kTouchCalTargets[i][1], color);
-  }
-  drawFittedText({28, 262, 120, 18},
-                 "step " + String(touchCalStep + 1) + " / " + String(kTouchCalPointCount),
-                 kColorAccent, kColorPanel, 2, 1);
-}
-
-int16_t mapCalibratedAxis(int16_t rawValue, int rawMin, int rawMax, bool invert,
-                          int16_t screenMax) {
-  if (rawMax == rawMin) {
-    return screenMax / 2;
-  }
-
-  long mapped = map(rawValue, rawMin, rawMax, 0, screenMax);
-  mapped = constrain(mapped, 0, screenMax);
-  if (invert) {
-    mapped = screenMax - mapped;
-  }
-  return static_cast<int16_t>(mapped);
-}
-
-void mapTouchPoint(int16_t rawX, int16_t rawY, int16_t& x, int16_t& y) {
-  if (!touchCal.valid) {
-    x = constrain(map(rawX, 0, 480, 0, display.width() - 1), 0, display.width() - 1);
-    y = constrain(map(rawY, 0, 320, 0, display.height() - 1), 0, display.height() - 1);
-    return;
-  }
-
-  const int16_t axisX = touchCal.swapXY ? rawY : rawX;
-  const int16_t axisY = touchCal.swapXY ? rawX : rawY;
-  x = mapCalibratedAxis(axisX, touchCal.rawMinX, touchCal.rawMaxX, touchCal.invertX,
-                        display.width() - 1);
-  y = mapCalibratedAxis(axisY, touchCal.rawMinY, touchCal.rawMaxY, touchCal.invertY,
-                        display.height() - 1);
-}
-
-void finishTouchCalibration() {
-  const TP_Point& topLeft = touchCalSamples[0];
-  const TP_Point& topRight = touchCalSamples[1];
-  const TP_Point& bottomLeft = touchCalSamples[2];
-  const TP_Point& bottomRight = touchCalSamples[3];
-
-  const long horizontalByX = labs(topRight.x - topLeft.x) + labs(bottomRight.x - bottomLeft.x);
-  const long horizontalByY = labs(topRight.y - topLeft.y) + labs(bottomRight.y - bottomLeft.y);
-  touchCal.swapXY = horizontalByY > horizontalByX;
-
-  int leftA;
-  int leftB;
-  int rightA;
-  int rightB;
-  int topA;
-  int topB;
-  int bottomA;
-  int bottomB;
-
-  if (touchCal.swapXY) {
-    leftA = topLeft.y;
-    leftB = bottomLeft.y;
-    rightA = topRight.y;
-    rightB = bottomRight.y;
-    topA = topLeft.x;
-    topB = topRight.x;
-    bottomA = bottomLeft.x;
-    bottomB = bottomRight.x;
-  } else {
-    leftA = topLeft.x;
-    leftB = bottomLeft.x;
-    rightA = topRight.x;
-    rightB = bottomRight.x;
-    topA = topLeft.y;
-    topB = topRight.y;
-    bottomA = bottomLeft.y;
-    bottomB = bottomRight.y;
-  }
-
-  const int16_t leftAvg = averageInt(leftA, leftB);
-  const int16_t rightAvg = averageInt(rightA, rightB);
-  const int16_t topAvg = averageInt(topA, topB);
-  const int16_t bottomAvg = averageInt(bottomA, bottomB);
-
-  touchCal.invertX = rightAvg < leftAvg;
-  touchCal.invertY = bottomAvg < topAvg;
-  touchCal.rawMinX = std::min(leftAvg, rightAvg);
-  touchCal.rawMaxX = std::max(leftAvg, rightAvg);
-  touchCal.rawMinY = std::min(topAvg, bottomAvg);
-  touchCal.rawMaxY = std::max(topAvg, bottomAvg);
-  touchCal.valid = true;
-  touchCalActive = false;
-  currentScreen = ScreenId::Dashboard;
-  saveTouchCalibration();
-
-  Serial.print("TOUCH;CAL;swap=");
-  Serial.print(touchCal.swapXY ? "1" : "0");
-  Serial.print(";invertX=");
-  Serial.print(touchCal.invertX ? "1" : "0");
-  Serial.print(";invertY=");
-  Serial.print(touchCal.invertY ? "1" : "0");
-  Serial.print(";minX=");
-  Serial.print(touchCal.rawMinX);
-  Serial.print(";maxX=");
-  Serial.print(touchCal.rawMaxX);
-  Serial.print(";minY=");
-  Serial.print(touchCal.rawMinY);
-  Serial.print(";maxY=");
-  Serial.println(touchCal.rawMaxY);
-
-  uiDirty = true;
-}
-
 void redrawUi() {
   updateWifiState();
   updateLoggingState();
@@ -1185,61 +844,8 @@ void redrawUi() {
       dashboardScreenLoaded = false;
       drawTextEditor();
       break;
-    case ScreenId::TouchCal:
-      dashboardScreenLoaded = false;
-      drawTouchCalibrationScreen();
-      break;
   }
   uiDirty = false;
-}
-
-bool i2cDevicePresent(uint8_t address) {
-  Wire.beginTransmission(address);
-  return Wire.endTransmission() == 0;
-}
-
-uint8_t detectTouchAddress() {
-  if (i2cDevicePresent(kGt911PrimaryAddress)) {
-    return kGt911PrimaryAddress;
-  }
-  if (i2cDevicePresent(kGt911SecondaryAddress)) {
-    return kGt911SecondaryAddress;
-  }
-  return 0;
-}
-
-void initTouchController() {
-  activeTouchAddress = detectTouchAddress();
-  Serial.print("TOUCH;SCAN;");
-  Serial.print(i2cDevicePresent(kGt911PrimaryAddress) ? "14" : "--");
-  Serial.print(";");
-  Serial.println(i2cDevicePresent(kGt911SecondaryAddress) ? "5D" : "--");
-  if (activeTouchAddress == 0) {
-    Serial.println("TOUCH;ADDR;NONE");
-    return;
-  }
-  touchController.begin(activeTouchAddress);
-  touchController.setRotation(ROTATION_NORMAL);
-  Serial.print("TOUCH;ADDR;");
-  Serial.println(activeTouchAddress, HEX);
-}
-
-void reportTouchStatus() {
-  if (millis() - lastTouchReportMs < 3000) {
-    return;
-  }
-  lastTouchReportMs = millis();
-  Serial.print("TOUCH;STATUS;");
-  Serial.print("scan14=");
-  Serial.print(i2cDevicePresent(kGt911PrimaryAddress) ? "Y" : "N");
-  Serial.print(";scan5D=");
-  Serial.print(i2cDevicePresent(kGt911SecondaryAddress) ? "Y" : "N");
-  Serial.print(";active=");
-  if (activeTouchAddress == 0) {
-    Serial.println("NONE");
-  } else {
-    Serial.println(activeTouchAddress, HEX);
-  }
 }
 
 void openTextEditor(TextField field) {
@@ -1344,15 +950,18 @@ void updateSensors() {
   lastReadMs = millis();
 
   tempSensors.requestTemperatures();
+  const int deviceCount = tempSensors.getDS18Count();
   const float inlet = tempSensors.getTempCByIndex(0);
   const float middle = tempSensors.getTempCByIndex(1);
   const float outlet = tempSensors.getTempCByIndex(2);
 
+  sensors.ds18Count = deviceCount;
+
   sensors.probeValid =
       isValidProbeTemp(inlet) && isValidProbeTemp(middle) && isValidProbeTemp(outlet);
-  if (isValidProbeTemp(inlet)) sensors.inletC = inlet;
-  if (isValidProbeTemp(middle)) sensors.middleC = middle;
-  if (isValidProbeTemp(outlet)) sensors.outletC = outlet;
+  sensors.inletC = isValidProbeTemp(inlet) ? inlet : NAN;
+  sensors.middleC = isValidProbeTemp(middle) ? middle : NAN;
+  sensors.outletC = isValidProbeTemp(outlet) ? outlet : NAN;
 
   sensors_event_t humidityEvent;
   sensors_event_t tempEvent;
@@ -1369,6 +978,9 @@ void updateSensors() {
 
   if (serialConnected) {
     Serial.print("SENSORS;");
+    Serial.print("DS18COUNT:");
+    Serial.print(deviceCount);
+    Serial.print(";");
     Serial.print("HOT:");
     Serial.print(sensors.inletC, 2);
     Serial.print(";MID:");
@@ -1455,23 +1067,6 @@ void readSerial() {
       handleSerialCommand(line);
     }
   }
-}
-
-void handleDashboardTap(int16_t x, int16_t y) {
-  if (pointInRect(x, y, loggingBadgeRect)) {
-    currentScreen = ScreenId::LoggingMenu;
-  } else if (pointInRect(x, y, wifiBadgeRect)) {
-    currentScreen = ScreenId::WifiMenu;
-  } else if (pointInRect(x, y, inletTargetRect)) {
-    activeTarget = TargetField::Inlet;
-    currentScreen = ScreenId::TargetMenu;
-  } else if (pointInRect(x, y, outletTargetRect)) {
-    activeTarget = TargetField::Outlet;
-    currentScreen = ScreenId::TargetMenu;
-  } else {
-    return;
-  }
-  uiDirty = true;
 }
 
 bool tappedBack(int16_t x, int16_t y) {
@@ -1594,101 +1189,6 @@ void handleTextEditorTap(int16_t x, int16_t y) {
   uiDirty = true;
 }
 
-void handleTouch() {
-  if (currentScreen == ScreenId::Dashboard && lvglReady && !touchCalActive) {
-    return;
-  }
-  if (activeTouchAddress == 0) {
-    return;
-  }
-  if (millis() - lastTouchPollMs < kTouchPollMs) {
-    return;
-  }
-  lastTouchPollMs = millis();
-  touchController.read();
-  if (!touchController.isTouched) {
-    if (touchCalActive && touchCalWaitForRelease) {
-      touchCalWaitForRelease = false;
-    }
-    return;
-  }
-  const int16_t rawX = touchController.points[0].x;
-  const int16_t rawY = touchController.points[0].y;
-  if (rawX < 0 || rawY < 0) {
-    return;
-  }
-
-  if (touchCalActive) {
-    if (touchCalWaitForRelease) {
-      return;
-    }
-    if (millis() - lastTouchMs < 120) {
-      return;
-    }
-    lastTouchMs = millis();
-    currentScreen = ScreenId::TouchCal;
-    touchCalSamples[touchCalStep] = touchController.points[0];
-    touchCalWaitForRelease = true;
-    ++touchCalStep;
-    if (touchCalStep >= kTouchCalPointCount) {
-      touchCalStep = 0;
-      finishTouchCalibration();
-    } else {
-      uiDirty = true;
-    }
-    return;
-  }
-
-  if (rawX > 480 || rawY > 320) {
-    return;
-  }
-  if (millis() - lastTouchMs < kTouchDebounceMs) {
-    return;
-  }
-  lastTouchMs = millis();
-  int16_t x = 0;
-  int16_t y = 0;
-  mapTouchPoint(rawX, rawY, x, y);
-
-  if (showTouchDebug) {
-    lastTouchDebugX = x;
-    lastTouchDebugY = y;
-    touchDebugLatched = true;
-    uiDirty = true;
-  }
-
-  if (serialConnected) {
-    Serial.print("TOUCH;");
-    Serial.print("raw=");
-    Serial.print(rawX);
-    Serial.print(",");
-    Serial.print(rawY);
-    Serial.print(";mapped=");
-    Serial.print(x);
-    Serial.print(";");
-    Serial.println(y);
-  }
-
-  switch (currentScreen) {
-    case ScreenId::Dashboard:
-      break;
-    case ScreenId::WifiMenu:
-      handleWifiMenuTap(x, y);
-      break;
-    case ScreenId::LoggingMenu:
-      handleLoggingMenuTap(x, y);
-      break;
-    case ScreenId::TargetMenu:
-      handleTargetMenuTap(x, y);
-      break;
-    case ScreenId::TextEditor:
-      handleTextEditorTap(x, y);
-      break;
-    case ScreenId::TouchCal:
-      break;
-  }
-}
-
 }  // namespace
 
 void setup() {
@@ -1697,15 +1197,23 @@ void setup() {
 
   pinMode(BoardConfig::kRelayHotPin, OUTPUT);
   pinMode(BoardConfig::kRelayColdPin, OUTPUT);
+  pinMode(BoardConfig::kFunctionSelectPin, OUTPUT);
   setRelayHot(false);
   setRelayCold(false);
+  digitalWrite(BoardConfig::kFunctionSelectPin, LOW);
+  pinMode(BoardConfig::kOneWirePin, INPUT_PULLUP);
 
   analogSetAttenuation(ADC_11db);
   analogReadResolution(12);
 
   loadSettings();
+  settings.wifiSsid = WIFI_SSID;
+  settings.wifiPass = WIFI_PASS;
+  saveSettings();
 
   tempSensors.begin();
+  tempSensors.setWaitForConversion(true);
+  tempSensors.setCheckForConversion(true);
   Wire.begin(BoardConfig::kI2cSdaPin, BoardConfig::kI2cSclPin);
   sht4.begin();
 
@@ -1714,12 +1222,11 @@ void setup() {
   display.setBrightness(220);
   display.setTextDatum(top_left);
   display.setTextFont(2);
-  initTouchController();
   initLvgl();
   lastLvglTickMs = millis();
-
-  if (touchCalActive) {
-    currentScreen = ScreenId::TouchCal;
+  if (serialConnected) {
+    Serial.print("DS18;COUNT;");
+    Serial.println(tempSensors.getDS18Count());
   }
 
   startWifiConnect();
@@ -1732,12 +1239,10 @@ void loop() {
   lastLvglTickMs = now;
   updateSerialConnection();
   readSerial();
-  reportTouchStatus();
   ensureWifiConnected();
   updateSensors();
   controlRelays();
   publishFeeds();
-  handleTouch();
 
   if (uiDirty) {
     redrawUi();

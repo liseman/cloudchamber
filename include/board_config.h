@@ -15,6 +15,7 @@ constexpr uint8_t kRelayHotPin = 1;
 constexpr uint8_t kRelayColdPin = 2;
 constexpr uint8_t kI2cSdaPin = 15;
 constexpr uint8_t kI2cSclPin = 16;
+constexpr uint8_t kFunctionSelectPin = 45;
 
 // Relay modules vary by board and driver board. Keep the current HIGH = ON
 // behavior as the default until we confirm the new hardware.

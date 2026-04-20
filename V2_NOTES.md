@@ -14,12 +14,20 @@ This clone is the local starting point for the next hardware revision.
   - shared DS18B20 1-Wire bus on GPIO18
   - ALS-PT19 analog light sensor on GPIO17
   - SHT4x on I2C GPIO15/16
+- The CrowPanel function-select line on GPIO45 is now driven low at boot to enable wireless-module mode on the module header.
 - ADS1115 support was removed from the current hardware plan.
-- The firmware now includes a CrowPanel-specific LovyanGFX display driver, GT911 touch support, and an LVGL dashboard/menu flow.
+- The firmware now includes a CrowPanel-specific LovyanGFX display driver and an LVGL dashboard/menu flow tuned for the 480x320 display.
+- GT911 touch support and calibration code were removed from the current firmware branch so the display stack is dashboard-only for now.
+- The dashboard layout has been iterated on-device to improve contrast, row alignment, larger text, consistent spacing, and explicit red/yellow/green WiFi and logging status text.
+- LVGL font config now enables Montserrat 22 and 24 so the dashboard can use larger text without custom font assets.
+- DS18B20 rows now show explicit state on-screen:
+  - live temperature when valid
+  - `missing` when a probe index is not found on the 1-Wire bus
+  - `read err` when a probe is present but the reading is invalid
 
 ## Next steps
 
-1. Finish display color and styling cleanup so the LVGL dashboard matches the shipped Elecrow demo more closely.
-2. Keep improving GT911 touch behavior and calibration persistence on the CrowPanel hardware.
-3. Confirm DS18B20 probe order on the shared bus, or switch to address-based labeling if the physical order matters.
+1. Confirm the latest on-device layout is final after one more physical-screen review pass.
+2. Confirm DS18B20 probe order on the shared bus, or switch to address-based labeling if the physical order matters.
+3. Verify the wireless-module header is now powered and in the expected mode with GPIO45 held low.
 4. Verify the installed relay modules match the current `HIGH = ON` assumption.
