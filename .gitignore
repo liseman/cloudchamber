@@ -3,3 +3,9 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+__pycache__/
+*.log
+*.pid
+include/secrets.h
+.tools/
+.venv/
