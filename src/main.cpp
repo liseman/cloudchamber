@@ -344,7 +344,12 @@ void startTouchCalibration() {
   touchCalActive = true;
   touchCalStep = 0;
   lvglTouchPressed = false;
+  lvglTouchX = 0;
+  lvglTouchY = 0;
   touchCalWaitForRelease = true;
+  dashboardScreenLoaded = false;
+  lastTouchMs = 0;
+  lastLvglTouchMs = 0;
   currentScreen = ScreenId::TouchCal;
   uiDirty = true;
 }
@@ -436,12 +441,12 @@ void openOutletTargetEvent(lv_event_t* event) {
 }
 
 void styleHeaderButton(lv_obj_t* button, lv_obj_t** label, const char* text) {
-  lv_obj_set_size(button, 116, 36);
+  lv_obj_set_size(button, 96, 32);
   styleFlatButton(button, lv_color_hex(kUiCardHex), lv_color_hex(0x9bb7c8));
   *label = lv_label_create(button);
   lv_label_set_text(*label, text);
   lv_obj_set_style_text_color(*label, lv_color_hex(kUiInkHex), LV_PART_MAIN);
-  lv_obj_set_style_text_font(*label, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(*label, &lv_font_montserrat_16, LV_PART_MAIN);
   lv_obj_center(*label);
 }
 
@@ -508,18 +513,24 @@ void createDashboardLvgl() {
   lv_obj_set_style_shadow_width(dashboardCard, 0, LV_PART_MAIN);
   lv_obj_set_style_pad_all(dashboardCard, 0, LV_PART_MAIN);
 
-  loggingButton = lv_btn_create(dashboardCard);
-  lv_obj_set_pos(loggingButton, 24, 14);
+  lv_obj_t* headerRow = lv_obj_create(dashboardCard);
+  lv_obj_remove_style_all(headerRow);
+  lv_obj_set_size(headerRow, 420, 36);
+  lv_obj_set_pos(headerRow, 18, 14);
+  lv_obj_set_flex_flow(headerRow, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(headerRow, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_clear_flag(headerRow, LV_OBJ_FLAG_SCROLLABLE);
+
+  loggingButton = lv_btn_create(headerRow);
   styleHeaderButton(loggingButton, &loggingLabel, "logging");
   lv_obj_add_event_cb(loggingButton, openLoggingMenuEvent, LV_EVENT_CLICKED, nullptr);
 
-  touchButton = lv_btn_create(dashboardCard);
-  lv_obj_set_pos(touchButton, 170, 14);
+  touchButton = lv_btn_create(headerRow);
   styleHeaderButton(touchButton, &touchLabel, "touch");
   lv_obj_add_event_cb(touchButton, openTouchCalibrationEvent, LV_EVENT_CLICKED, nullptr);
 
-  wifiButton = lv_btn_create(dashboardCard);
-  lv_obj_set_pos(wifiButton, 316, 14);
+  wifiButton = lv_btn_create(headerRow);
   styleHeaderButton(wifiButton, &wifiLabel, "wifi");
   lv_obj_add_event_cb(wifiButton, openWifiMenuEvent, LV_EVENT_CLICKED, nullptr);
 
@@ -1027,7 +1038,7 @@ void drawTouchCalibrationScreen() {
   drawFittedText({28, 22, 260, 24}, "touch calibration", kColorInk, kColorPanel, 2, 1);
   drawFittedText({28, 52, 340, 14}, "tap the red target in each corner",
                  kColorMuted, kColorPanel, 1, 1);
-  drawFittedText({28, 68, 320, 14}, "only needed if no saved touch map exists",
+  drawFittedText({28, 68, 320, 14}, "lift your finger after each corner tap",
                  kColorMuted, kColorPanel, 1, 1);
 
   for (int i = 0; i < kTouchCalPointCount; ++i) {
@@ -1603,7 +1614,32 @@ void handleTouch() {
   }
   const int16_t rawX = touchController.points[0].x;
   const int16_t rawY = touchController.points[0].y;
-  if (rawX < 0 || rawY < 0 || rawX > 480 || rawY > 320) {
+  if (rawX < 0 || rawY < 0) {
+    return;
+  }
+
+  if (touchCalActive) {
+    if (touchCalWaitForRelease) {
+      return;
+    }
+    if (millis() - lastTouchMs < 120) {
+      return;
+    }
+    lastTouchMs = millis();
+    currentScreen = ScreenId::TouchCal;
+    touchCalSamples[touchCalStep] = touchController.points[0];
+    touchCalWaitForRelease = true;
+    ++touchCalStep;
+    if (touchCalStep >= kTouchCalPointCount) {
+      touchCalStep = 0;
+      finishTouchCalibration();
+    } else {
+      uiDirty = true;
+    }
+    return;
+  }
+
+  if (rawX > 480 || rawY > 320) {
     return;
   }
   if (millis() - lastTouchMs < kTouchDebounceMs) {
@@ -1631,23 +1667,6 @@ void handleTouch() {
     Serial.print(x);
     Serial.print(";");
     Serial.println(y);
-  }
-
-  if (touchCalActive) {
-    if (touchCalWaitForRelease) {
-      return;
-    }
-    currentScreen = ScreenId::TouchCal;
-    touchCalSamples[touchCalStep] = touchController.points[0];
-    touchCalWaitForRelease = true;
-    ++touchCalStep;
-    if (touchCalStep >= kTouchCalPointCount) {
-      touchCalStep = 0;
-      finishTouchCalibration();
-    } else {
-      uiDirty = true;
-    }
-    return;
   }
 
   switch (currentScreen) {
